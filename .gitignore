@@ -1,0 +1,5 @@
+node_modules/
+.env
+*.wav
+prompt.txt
+*.bak-*

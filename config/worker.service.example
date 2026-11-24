@@ -1,0 +1,16 @@
+[Unit]
+Description=EDEKA Phonic LiveKit Worker
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/phonic-worker
+EnvironmentFile=/root/phonic-worker/.env
+ExecStart=/usr/bin/node agent.js start
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/edeka-phonic-worker.log
+StandardError=append:/var/log/edeka-phonic-worker.log
+
+[Install]
+WantedBy=multi-user.target
