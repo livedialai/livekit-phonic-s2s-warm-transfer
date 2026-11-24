@@ -1,4 +1,4 @@
-// LiveKit Cloud worker with Phonic S2S + warm transfer
+// the store – LiveKit-Cloud-Worker mit Phonic S2S + Warm Transfer
 // Voice: sabrina (Phonic), Sprache: de
 import {
   ServerOptions,
@@ -14,6 +14,7 @@ import { Room } from '@livekit/rtc-node';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import { summarizeTranscript, phonicTtsPcm, playBriefing, startMoh } from './warmtransfer.js';
+import { cartAdd, cartView, lieferSpeichern, abschluss } from './cart.js';
 import { z } from 'zod';
 
 const BACKEND = process.env.BACKEND_URL;
@@ -21,7 +22,7 @@ const DID = process.env.CALLED_DID || '<transfer-number>';
 const SIP_TRUNK_ID = process.env.LIVEKIT_SIP_OUTBOUND_TRUNK;
 const SUPERVISOR = process.env.SUPERVISOR_PHONE_NUMBER || '<transfer-number>';
 
-// --- Tools (webhook adapter) ---
+// --- Tools (Webhook-Adapter, laufen auf s2s.example.de) ---
 async function callTool(name, query) {
   const url = `${process.env.TOOLS_BASE_URL}/${name}`;
   const res = await fetch(url, {
@@ -31,13 +32,31 @@ async function callTool(name, query) {
     signal: AbortSignal.timeout(8000),
   });
   if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
-  return await res.text();
+  // Adapter liefert {"result":"<text>"} — dem S2S-Modell muss der reine Text
+  // uebergeben werden, nicht der JSON-String mit Escapes (sonst findet es keine Artikel).
+  const raw = await res.text();
+  try {
+    const j = JSON.parse(raw);
+    const out = j.result ?? j.text ?? j.antwort;
+    if (typeof out === 'string') return out;
+    if (out != null) return JSON.stringify(out);
+    return raw;
+  } catch {
+    return raw;
+  }
 }
 
 function parseForwards(raw) {
   try {
-    const d = JSON.parse(raw);
-    const text = typeof d === 'string' ? d : (d.result || d.text || '');
+    let text = String(raw ?? '');
+    // callTool liefert seit dem Parsing-Fix reinen Text. Falls doch noch ein
+    // JSON-Objekt ankommt (aeltere Variante), hier auspacken.
+    if (text.trim().startsWith('{')) {
+      try {
+        const d = JSON.parse(text);
+        text = typeof d === 'string' ? d : (d.result || d.text || '');
+      } catch { /* war kein JSON — Text unveraendert weiterverwenden */ }
+    }
     const out = [];
     for (const line of String(text).split('\n')) {
       const m = line.match(/^\s*\d+\)\s*(.+?)\s*(?:→|->)\s*([+0-9][0-9\s\/-]{5,})/);
@@ -78,7 +97,7 @@ const transferTool = llm.tool({
     'Aufrufen, sobald der Anrufer nach einer Person fragt - ohne Rueckfrage. ' +
     'Nur den Namen uebergeben. NIEMALS eine Telefonnummer.',
   parameters: z.object({
-    name: z.string().describe('Name des Ansprechpartners, z.B. "Chef" oder "Frank Schmidt"'),
+    name: z.string().describe('Name des Ansprechpartners, z.B. "Chef" oder "a colleague"'),
   }),
   execute: async ({ name }, opts) => {
     const ctx = opts?.ctx;
@@ -126,11 +145,12 @@ const transferTool = llm.tool({
     }
     console.log('TRANSFER-SUMMARY', JSON.stringify(summary).slice(0, 240));
 
-    // 3) Zusammenfassung als Audio (Phonic TTS)
+    // 3) Briefing-Text + optional vorproduziertes Audio (Fallback)
     let pcm = null;
+    let ttsText = null;
     if (summary) {
       try {
-        const ttsText = `${summary} Soll ich Sie mit dem Anrufer verbinden?`;
+        ttsText = `${summary} Soll ich Sie mit dem Anrufer verbinden?`;
         pcm = await phonicTtsPcm(ttsText, { apiKey: process.env.PHONIC_API_KEY });
         console.log('TRANSFER-TTS-BYTES', pcm.length);
       } catch (e) {
@@ -191,16 +211,6 @@ const transferTool = llm.tool({
         });
         console.log('TRANSFER-CHEF-ANSWERED', participant?.participantId || '');
 
-        // c) Briefing (Wave, Sabrina) - nur im Consulting-Raum
-        if (pcm) {
-          try {
-            await playBriefing(hroom, pcm);
-            console.log('TRANSFER-BRIEFING-PLAYED');
-          } catch (e) {
-            console.log('TRANSFER-BRIEFING-FAIL', (e?.message || String(e)).slice(0, 160));
-          }
-        }
-
         // d) TransferAgent-Session im Consulting-Raum (Zustimmung / Ablehnung)
         const verbindenTool = llm.tool({
           description: 'Nach Zustimmung: verbindet den Anrufer mit dem Mitarbeiter.',
@@ -249,7 +259,8 @@ const transferTool = llm.tool({
             voice: process.env.PHONIC_VOICE || 'sabrina',
             defaultLanguage: 'de',
             additionalLanguages: [],
-            minWordsToInterrupt: 2,
+            // 1 statt 2: Ein einzelnes "Ja" muss als Antwort zaehlen.
+            minWordsToInterrupt: 1,
             generateWelcomeMessage: false,
           }),
         });
@@ -257,6 +268,27 @@ const transferTool = llm.tool({
           agent: new TransferAgent({ tools: { verbinden: verbindenTool, zurueck: zurueckTool } }),
           room: hroom,
         });
+        // Briefing ueber DIESELBE Session sprechen. Damit kennt die
+        // Turn-Detection den Sprechzustand und hoert direkt danach zu —
+        // kein separater Track, kein Timing-Loch.
+        if (ttsText) {
+          try {
+            const speech = bsession.say(ttsText, { allowInterruptions: false });
+            await speech.waitForPlayout();
+            console.log('TRANSFER-BRIEFING-SAID');
+          } catch (e) {
+            console.log('TRANSFER-BRIEFING-SAY-FAIL', (e?.message || String(e)).slice(0, 160));
+            // Fallback: vorproduziertes Wave ueber einen Track
+            if (pcm) {
+              try {
+                await playBriefing(hroom, pcm);
+                console.log('TRANSFER-BRIEFING-PLAYED');
+              } catch (e2) {
+                console.log('TRANSFER-BRIEFING-FAIL', (e2?.message || String(e2)).slice(0, 160));
+              }
+            }
+          }
+        }
         console.log('TRANSFER-AGENT-READY');
       } catch (e) {
         console.log('TRANSFER-FAIL', name, phone, (e?.message || String(e)).slice(0, 200));
@@ -277,15 +309,103 @@ const transferTool = llm.tool({
 
 const INSTRUCTIONS = fs.readFileSync(new URL('./prompt.txt', import.meta.url), 'utf8');
 
+// --- Warenkorb / Lieferdaten / Bestellung (1:1 aus dem jambonz-Cascade-Stack) ---
+// State liegt pro LiveKit-Raum, ein Raum = ein Anruf.
+const ROOM = () => globalThis.__roomName || 'unknown-room';
+
+/** "6 x 0,33 l" -> 6 ; sonst 1 (Gebinde-Erkennung wie im Cascade-Stack) */
+function packSize(artikel) {
+  const m = String(artikel).match(/(\d+)\s*[x×]\s*[\d,.]+\s*l/i);
+  return m ? Math.max(1, Number(m[1])) : 1;
+}
+
+const warenkorbHinzufuegenTool = llm.tool({
+  description:
+    'Legt eine vom Kunden bestaetigte Position in den Warenkorb. menge = Anzahl Gebinde. ' +
+    'Erst aufrufen, nachdem der Kunde den Preis gehoert und bestaetigt hat.',
+  parameters: z.object({
+    artikel: z.string().describe('Artikelname exakt wie im Suchergebnis, z.B. "the store Bio Suessrahmbutter 250 g"'),
+    menge: z.number().describe('Anzahl Gebinde/Packungen'),
+    preis: z.number().describe('Einzelpreis pro Gebinde in Euro, z.B. 2.79'),
+    einheit: z
+      .enum(['gebinde', 'flasche'])
+      .optional()
+      .describe('flasche, wenn der Kunde Flaschen nennt, sonst gebinde'),
+  }),
+  execute: async ({ artikel, menge, preis, einheit }) => {
+    const pack = packSize(artikel);
+    let gebinde = Math.max(1, Number(menge) || 1);
+    const willFlaschen =
+      String(einheit || '').toLowerCase().startsWith('flasch') || Number(menge) > 1;
+    if (pack > 1 && willFlaschen) gebinde = Math.max(1, Math.ceil(Number(menge) / pack));
+    const out = await cartAdd(ROOM(), { artikel, menge: gebinde, preis });
+    return JSON.stringify({ ...out, erkannte_gebinde: gebinde, packung: pack });
+  },
+});
+
+const warenkorbLesenTool = llm.tool({
+  description: 'Liest den Warenkorb mit Positionen und Summe. Vor jeder Summenansage aufrufen.',
+  parameters: z.object({}),
+  execute: async () => JSON.stringify(await cartView(ROOM())),
+});
+
+const lieferdatenTool = llm.tool({
+  description:
+    'Speichert Lieferdaten. Nur die Felder senden, die der Kunde genannt hat. ' +
+    'Nach einer E-Mail-Adresse wird NICHT gefragt — die Bestaetigung geht an den Markt.',
+  parameters: z.object({
+    name: z.string().optional(),
+    strasse: z.string().optional(),
+    hausnummer: z.string().optional(),
+    plz: z.string().optional(),
+    ort: z.string().optional(),
+    etage: z.string().optional(),
+  }),
+  execute: async (args) => JSON.stringify(await lieferSpeichern(ROOM(), args)),
+});
+
+const bestellungTool = llm.tool({
+  description:
+    'Schliesst die Bestellung ab, vergibt die Bestellnummer und schickt die Bestaetigung per E-Mail. ' +
+    'Erst aufrufen, wenn Warenkorb und alle Lieferdaten inklusive E-Mail vorliegen.',
+  parameters: z.object({}),
+  execute: async () => JSON.stringify(await abschluss(ROOM())),
+});
+
+// Datum/Uhrzeit zur Laufzeit — wird bei jedem Session-Start neu erzeugt,
+// damit der Agent "Wie spaet ist es?" und "Welcher Tag ist heute?" beantworten kann.
+function nowContext() {
+  const d = new Date();
+  const datum = new Intl.DateTimeFormat('de-DE', {
+    timeZone: 'Europe/Berlin',
+    weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+  }).format(d);
+  const zeit = new Intl.DateTimeFormat('de-DE', {
+    timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(d);
+  return `
+
+## AKTUELLES DATUM UND UHRZEIT
+Es ist jetzt ${datum}, ${zeit} Uhr (Europe/Berlin).
+- Nutze diese Angaben fuer alle Fragen nach Datum, Wochentag, Uhrzeit und fuer "heute", "morgen", "gestern".
+- Nenne niemals eine Uhrzeit oder ein Datum, das nicht hier steht oder vom Kunden kommt.
+- Wenn der Markt geschlossen hat, sage das offen und biete an, die Bestellung fuer die naechste Oeffnung aufzunehmen.
+`;
+}
+
 class MarketAgent extends voice.Agent {
   constructor() {
     super({
-      instructions: INSTRUCTIONS,
+      instructions: INSTRUCTIONS + nowContext(),
       tools: {
         preis_abfrage: preisTool,
         angebote_abfrage: angeboteTool,
         weiterleitungen: weiterleitungenTool,
         weiterleiten: transferTool,
+        warenkorb_hinzufuegen: warenkorbHinzufuegenTool,
+        warenkorb_lesen: warenkorbLesenTool,
+        lieferdaten_speichern: lieferdatenTool,
+        bestellung_abschliessen: bestellungTool,
       },
     });
   }
@@ -314,9 +434,10 @@ class TransferAgent extends voice.Agent {
     super({ instructions: TRANSFER_INSTRUCTIONS, tools: opts.tools });
     this.opts = opts;
   }
-  async onEnter() {
-    this.session.generateReply();
-  }
+  // KEIN generateReply() beim Betreten: Die Frage "Soll ich Sie mit dem Anrufer
+  // verbinden?" wurde bereits im Briefing-Audio gestellt. Der Agent muss schweigen
+  // und auf die Antwort des Mitarbeiters warten — sonst redet er dazwischen und
+  // das erste "Ja" geht als Barge-in verloren.
 }
 
 export default defineAgent({
